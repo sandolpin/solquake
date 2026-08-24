@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<issues format="6" by="lint 8.6.1" type="baseline" client="gradle" dependencies="false" name="AGP (8.6.1)" variant="fatal" version="8.6.1">
+
+    <issue
+        id="InvalidFragmentVersionForActivityResult"
+        message="Upgrade Fragment version to at least 1.3.0."
+        errorLine1="        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* 結果は特に処理不要 */ }"
+        errorLine2="        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="src/main/java/com/sandolpin/weatherquake/MainActivity.kt"
+            line="28"
+            column="9"/>
+    </issue>
+
+</issues>
