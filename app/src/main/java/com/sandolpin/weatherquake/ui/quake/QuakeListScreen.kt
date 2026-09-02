@@ -16,6 +16,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -39,15 +43,14 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+/** 「過去の地震履歴」に表示する最大件数。これを超える分は全履歴画面(QuakeFullHistoryScreen)で確認する。 */
+private const val HISTORY_PREVIEW_COUNT = 3
+
 /**
  * 地震情報一覧画面。
  *
- * 注意: SharedTransitionLayoutの sharedBounds/sharedElement は、LazyColumn/LazyRow の
- * アイテム(表示コンポーザブルを使い回す=リサイクルする仕組み)と相性が悪く、
- * カードの重なり・間隔崩壊・意図しない移動といった表示バグを引き起こすことが知られている。
- * 地震履歴はAPI側の取得上限(最大30件程度)で十分小さいため、
- * ここでは LazyColumn ではなく通常の Column + verticalScroll を使い、
- * この問題を根本的に回避している。
+ * [変更点] 「過去の地震履歴」は直近3件のみをプレビュー表示し、それ以上は
+ * ヘッダー右の矢印ボタンから遷移する全履歴画面(地図+全件リスト)で確認する形にした。
  */
 @OptIn(ExperimentalSharedTransitionApi::class)
 @Composable
@@ -55,6 +58,7 @@ fun QuakeListScreen(
     sharedTransitionScope: SharedTransitionScope,
     animatedVisibilityScope: AnimatedVisibilityScope,
     onCardClick: (String) -> Unit,
+    onOpenHistory: () -> Unit = {},
     viewModel: QuakeViewModel = viewModel()
 ) {
     val state by viewModel.state.collectAsState()
@@ -88,22 +92,39 @@ fun QuakeListScreen(
             }
         }
 
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            modifier = Modifier.fillMaxWidth().clickable(onClick = onOpenHistory),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
             Text("過去の地震履歴", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+            IconButton(onClick = onOpenHistory) {
+                Icon(Icons.Filled.ChevronRight, contentDescription = "地震履歴をすべて見る")
+            }
         }
 
-        state.quakes.forEachIndexed { index, quake ->
+        val previewQuakes = remember(state.quakes) { state.quakes.take(HISTORY_PREVIEW_COUNT) }
+
+        previewQuakes.forEachIndexed { index, quake ->
             with(sharedTransitionScope) {
-                QuakeHistoryCard(
-                    quake = quake,
-                    contrast = state.settings.intensityColorContrast,
-                    modifier = Modifier
-                        .sharedBounds(
-                            rememberSharedContentState(key = "quake-bounds-${quake.id}_$index"),
-                            animatedVisibilityScope = animatedVisibilityScope
-                        )
-                        .clickable { onCardClick(quake.id) }
-                )
+                Column {
+                    QuakeHistoryCard(
+                        quake = quake,
+                        contrast = state.settings.intensityColorContrast,
+                        modifier = Modifier
+                            .sharedBounds(
+                                rememberSharedContentState(key = "quake-bounds-${quake.id}_$index"),
+                                animatedVisibilityScope = animatedVisibilityScope
+                            )
+                            .clickable { onCardClick(quake.id) }
+                    )
+                    Text(
+                        quake.issueType.displayName,
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 6.dp, top = 4.dp)
+                    )
+                }
             }
         }
     }
@@ -134,8 +155,12 @@ private fun ConnectionStatusBar(status: ConnectionStatus, lastUpdated: Long) {
     }
 }
 
+/**
+ * 地震履歴1件分のカード。QuakeListScreen(プレビュー3件)・QuakeFullHistoryScreen(全件)の
+ * 両方から使うためinternalにしている。
+ */
 @Composable
-private fun QuakeHistoryCard(quake: QuakeCardState, contrast: com.sandolpin.weatherquake.data.settings.IntensityColorContrast, modifier: Modifier = Modifier) {
+internal fun QuakeHistoryCard(quake: QuakeCardState, contrast: com.sandolpin.weatherquake.data.settings.IntensityColorContrast, modifier: Modifier = Modifier) {
     val level = IntensityLevel.fromP2pScale(quake.maxScale)
     Surface(
         shape = RoundedCornerShape(14.dp),

@@ -16,6 +16,9 @@ enum class IntensityLevel(val label: String, val bgColor: Color, val textColor: 
     TWO("2", Color(0xFF4378B5), Color.White),
     THREE("3", Color(0xFF54E867), Color.Black),
     FOUR("4", Color(0xFFFFDF3D), Color.Black),
+    // P2P地震情報APIのscale=46相当。震度速報(ScalePrompt)の直後など、
+    // 「5弱以上と推定されるが、詳しい震度情報がまだ届いていない」状態を表す特別な値。
+    FIVE_MINUS_OR_ABOVE_UNCONFIRMED("5+?", Color(0xFFFF8A00), Color.Black),
     FIVE_MINUS("5-", Color(0xFFFFAF24), Color.Black),
     FIVE_PLUS("5+", Color(0xFFFF6C0A), Color.White),
     SIX_MINUS("6-", Color(0xFFFF0000), Color.White),
@@ -26,6 +29,7 @@ enum class IntensityLevel(val label: String, val bgColor: Color, val textColor: 
     val formalLabel: String
         get() = when (this) {
             UNKNOWN -> "不明"
+            FIVE_MINUS_OR_ABOVE_UNCONFIRMED -> "5弱以上と推定(未入電)"
             FIVE_MINUS -> "5弱"
             FIVE_PLUS -> "5強"
             SIX_MINUS -> "6弱"
@@ -51,12 +55,14 @@ enum class IntensityLevel(val label: String, val bgColor: Color, val textColor: 
         /**
          * P2P地震情報API(v2)の scale (震度*10。5弱=45, 5強=50, 6弱=55, 6強=60等)からenumへ変換する。
          * scaleがnull、または未観測(-1)の場合はUNKNOWNを返す。
+         * 46は「震度5弱以上と推定されるが、詳しい震度情報をまだ入手していない」特別な値。
          */
         fun fromP2pScale(scale: Int?): IntensityLevel = when (scale) {
             10 -> ONE
             20 -> TWO
             30 -> THREE
             40 -> FOUR
+            46 -> FIVE_MINUS_OR_ABOVE_UNCONFIRMED
             45 -> FIVE_MINUS
             50 -> FIVE_PLUS
             55 -> SIX_MINUS

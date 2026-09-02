@@ -23,6 +23,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.OkHttpClient
@@ -35,14 +36,14 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Wolfx APIのWebSocketに常時接続し、緊急地震速報を受信するForeground Service。
- * 加えて、同じポーリングループの中でP2P地震情報(地震情報/code=551)も定期取得する
- * (常駐Serviceを2つ持たずに済ませるための相乗り設計)。
+ * 加えて、同じポーリングループの中でP2P地震情報(地震情報/code=551)も定期取得する。
  *
- * ポイント:
- * - startForeground()を5秒以内に呼ばないとOSにクラッシュさせられるため、onStartCommand内で最優先に実行する
- * - 通信が切れても5秒後に自動で再接続する
- * - 受信したデータはEewRepository/QuakeRepositoryを通じてUI側に伝える
- * - 通知要否・スタイルの判定にはDataStore(SettingsRepository)の最新値を都度参照する
+ * [MapLibre移行に伴う変更点]
+ * NotificationHelper.sendEewNotification/sendQuakeNotificationが、地図生成(MapSnapshotter)を
+ * 伴うためsuspend funになった。そのため:
+ * - fetchOnce()をsuspend funに変更(呼び出し元のstartPollingは元々コルーチン内なので影響なし)
+ * - handleMessage()もsuspend funに変更し、WebSocketコールバック(onMessage、コルーチン外)からは
+ *   serviceScope.launch { handleMessage(text) } という形で呼ぶように変更した
  */
 class EewService : Service() {
 
@@ -52,7 +53,6 @@ class EewService : Service() {
         private const val WS_URL = "wss://ws-api.wolfx.jp/jma_eew"
         private const val API_TEST_URL = "https://api.wolfx.jp/jma_eew.json"
         private const val RECONNECT_DELAY_MS = 5000L
-        // P2P地震情報は緊急地震速報ほど即時性が求められないため、EEWポーリングより長い間隔で確認する
         private const val QUAKE_POLL_INTERVAL_MS = 20_000L
 
         fun start(context: Context) {
@@ -68,7 +68,6 @@ class EewService : Service() {
             context.stopService(Intent(context, EewService::class.java))
         }
 
-        /** 設定画面の「API接続テスト」用の一回限りのテスト通信 */
         fun testConnection(onResult: (success: Boolean, label: String, message: String) -> Unit) {
             val client = OkHttpClient()
             val request = Request.Builder().url(API_TEST_URL).build()
@@ -115,7 +114,6 @@ class EewService : Service() {
         settingsRepository = SettingsRepository(applicationContext)
         ApiPollingSettings.load(this)
 
-        // DataStoreの最新設定値を、コールバック(非suspend)からも参照できるようキャッシュしておく
         serviceScope.launch {
             settingsRepository.settingsFlow.collect { latestSettings = it }
         }
@@ -152,7 +150,9 @@ class EewService : Service() {
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
-                handleMessage(text)
+                // handleMessageはsuspend funのため、WebSocketのコールバックスレッド(コルーチン外)からは
+                // serviceScope.launchで包んで呼び出す。
+                serviceScope.launch { handleMessage(text) }
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
@@ -181,7 +181,6 @@ class EewService : Service() {
         mainHandler.postDelayed(runnable, RECONNECT_DELAY_MS)
     }
 
-    /** WebSocketとは別に、指定した間隔(秒)でWolfx APIをHTTPで取得し直すループ */
     private fun startPolling(intervalSeconds: Int) {
         pollingJob?.cancel()
         pollingJob = serviceScope.launch {
@@ -192,7 +191,6 @@ class EewService : Service() {
         }
     }
 
-    /** P2P地震情報(地震情報)を定期取得し、新着があれば通知する */
     private fun startQuakePolling() {
         quakePollingJob?.cancel()
         quakePollingJob = serviceScope.launch {
@@ -206,29 +204,32 @@ class EewService : Service() {
         }
     }
 
-    private fun fetchOnce() {
+    private suspend fun fetchOnce() {
         try {
             val request = Request.Builder().url(API_TEST_URL).build()
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return
-                val body = response.body?.string() ?: return
-
-                EewRepository.markFetched()
-
-                val eew = gson.fromJson(body, JmaEew::class.java)
-                if (eew.isTraining || eew.EventID.isBlank()) return
-
-                val isNewOrUpdated = EewRepository.onEewReceived(eew)
-                if (isNewOrUpdated) {
-                    NotificationHelper.sendEewNotification(this, eew, latestSettings)
+            // OkHttpの同期execute()はブロッキング呼び出しだが、serviceScopeがDispatchers.IOのため問題ない。
+            val body = withContext(Dispatchers.IO) {
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) return@use null
+                    response.body?.string()
                 }
+            } ?: return
+
+            EewRepository.markFetched()
+
+            val eew = gson.fromJson(body, JmaEew::class.java)
+            if (eew.isTraining || eew.EventID.isBlank()) return
+
+            val isNewOrUpdated = EewRepository.onEewReceived(eew)
+            if (isNewOrUpdated) {
+                NotificationHelper.sendEewNotification(this, eew, latestSettings)
             }
         } catch (e: Exception) {
             // 通信失敗時は次回のポーリングで再試行するため、ここでは無視する
         }
     }
 
-    private fun handleMessage(text: String) {
+    private suspend fun handleMessage(text: String) {
         try {
             val json = JsonParser.parseString(text).asJsonObject
             EewRepository.markFetched()

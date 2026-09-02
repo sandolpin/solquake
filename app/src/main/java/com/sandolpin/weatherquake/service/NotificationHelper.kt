@@ -2,15 +2,23 @@ package com.sandolpin.weatherquake.service
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Typeface
+import android.media.AudioAttributes
+import android.media.MediaPlayer
+import android.media.RingtoneManager
+import android.net.Uri
+import androidx.annotation.RawRes
 import androidx.compose.ui.graphics.toArgb
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.res.ResourcesCompat
+import com.sandolpin.weatherquake.MainActivity
 import com.sandolpin.weatherquake.R
 import com.sandolpin.weatherquake.data.IntensityLevel
 import com.sandolpin.weatherquake.data.eew.EewCodeType
@@ -23,19 +31,22 @@ import com.sandolpin.weatherquake.data.weather.WeatherUiState
 /**
  * 通知チャンネルの作成、通知の送信を担当する。
  * しきい値・ON/OFFなどの判定はAppSettingsState(DataStoreから読み込んだ値)を受け取って行う。
+ *
+ * [MapLibre移行に伴う変更点]
+ * sendEewNotification / sendQuakeNotification / sendTestNotification は、地図画像の生成に
+ * WarnAreaMapRenderer(MapSnapshotterベース、内部でメインスレッドに切り替える)を使うため
+ * suspend funになった。呼び出し元はすべてコルーチンスコープから呼ぶ必要がある
+ * (EewService, SettingsViewModel側の対応も参照)。
  */
 object NotificationHelper {
 
-    const val CHANNEL_ID_FORECAST = "eew_forecast"
-    const val CHANNEL_ID_WARNING = "eew_warning"
-    const val CHANNEL_ID_WARNING_BYPASS = "eew_warning_bypass" // サイレントモード中も鳴らす用
+    const val CHANNEL_ID_FORECAST = "eew_forecast_v3"
+    const val CHANNEL_ID_WARNING = "eew_warning_v3"
+    const val CHANNEL_ID_EMERGENCY_WARNING = "eew_emergency_warning_v3"
+
     const val CHANNEL_ID_QUAKE = "quake_info"
     const val CHANNEL_ID_WEATHER = "weather_periodic"
 
-    /**
-     * WarnArea[].ChiikiのAdmin(例: "熊本県熊本地方")から都道府県名だけを取り出すための一覧。
-     * 47都道府県の名称は互いに他のプレフィックスにならないため、startsWithで安全に抽出できる。
-     */
     private val PREFECTURE_NAMES = listOf(
         "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
         "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
@@ -49,7 +60,6 @@ object NotificationHelper {
     private fun extractPrefecture(chiiki: String): String =
         PREFECTURE_NAMES.firstOrNull { chiiki.startsWith(it) } ?: chiiki
 
-    /** しきい値スライダーに使う震度の並び(UNKNOWNは意味が無いため除外) */
     val selectableLevels: List<IntensityLevel> = listOf(
         IntensityLevel.ONE, IntensityLevel.TWO, IntensityLevel.THREE, IntensityLevel.FOUR,
         IntensityLevel.FIVE_MINUS, IntensityLevel.FIVE_PLUS,
@@ -58,24 +68,19 @@ object NotificationHelper {
 
     fun createChannels(context: Context) {
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
         manager.createNotificationChannel(
-            NotificationChannel(CHANNEL_ID_FORECAST, "緊急地震速報（予報）", NotificationManager.IMPORTANCE_DEFAULT)
-        )
-        manager.createNotificationChannel(
-            NotificationChannel(CHANNEL_ID_WARNING, "緊急地震速報（警報・特別警報）", NotificationManager.IMPORTANCE_HIGH).apply {
-                enableVibration(true)
+            NotificationChannel(CHANNEL_ID_FORECAST, "緊急地震速報（予報）", NotificationManager.IMPORTANCE_DEFAULT).apply {
+                setSound(null, null)
             }
         )
-        // サイレントモード(おやすみモード)中も鳴らすための専用チャンネル。
-        // Androidの仕様上、チャンネルのbypassDndは作成時にしか設定できないため、
-        // 通常の警報チャンネルとは別に用意し、設定ONの時だけこちらへ通知する。
-        // ユーザーは初回、端末側の「マナーモードの例外を許可」を求められる/設定で許可する必要がある。
         manager.createNotificationChannel(
-            NotificationChannel(CHANNEL_ID_WARNING_BYPASS, "緊急地震速報（警報・サイレント時も通知）", NotificationManager.IMPORTANCE_HIGH).apply {
-                enableVibration(true)
-                setBypassDnd(true)
-            }
+            buildSoundChannel(context, CHANNEL_ID_WARNING, "緊急地震速報（警報）", NotificationManager.IMPORTANCE_HIGH, R.raw.eew1, vibrate = true)
         )
+        manager.createNotificationChannel(
+            buildSoundChannel(context, CHANNEL_ID_EMERGENCY_WARNING, "緊急地震速報（特別警報）", NotificationManager.IMPORTANCE_HIGH, R.raw.eew2, vibrate = true)
+        )
+
         manager.createNotificationChannel(
             NotificationChannel(CHANNEL_ID_QUAKE, "地震情報", NotificationManager.IMPORTANCE_DEFAULT)
         )
@@ -84,11 +89,67 @@ object NotificationHelper {
         )
     }
 
+    private fun playForecastSound(context: Context, level: IntensityLevel) {
+        val soundUri = when (level) {
+            IntensityLevel.TWO -> Uri.parse("android.resource://${context.packageName}/${R.raw.intensity_2}")
+            IntensityLevel.THREE -> Uri.parse("android.resource://${context.packageName}/${R.raw.intensity_3}")
+            IntensityLevel.FOUR -> Uri.parse("android.resource://${context.packageName}/${R.raw.intensity_4}")
+            else -> RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+        }
+        try {
+            val player = MediaPlayer()
+            player.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_NOTIFICATION_EVENT)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build()
+            )
+            player.setDataSource(context, soundUri)
+            player.setOnCompletionListener { it.release() }
+            player.setOnErrorListener { mp, _, _ -> mp.release(); true }
+            player.prepare()
+            player.start()
+        } catch (e: Exception) {
+            // 再生に失敗しても通知自体の表示は継続するため、ここでは無視する
+        }
+    }
+
+    private fun buildSoundChannel(
+        context: Context,
+        id: String,
+        name: String,
+        importance: Int,
+        @RawRes soundRes: Int,
+        vibrate: Boolean = false
+    ): NotificationChannel {
+        val soundUri = Uri.parse("android.resource://${context.packageName}/$soundRes")
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_NOTIFICATION_EVENT)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+        return NotificationChannel(id, name, importance).apply {
+            setSound(soundUri, audioAttributes)
+            enableVibration(vibrate)
+        }
+    }
+
+    private fun buildContentIntent(context: Context, requestCode: Int): PendingIntent {
+        val intent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        return PendingIntent.getActivity(
+            context,
+            requestCode,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
     // ============================== 緊急地震速報 ==============================
 
     fun isEnabledForEew(eew: JmaEew, settings: AppSettingsState): Boolean {
         if (!settings.notifyOnEew) return false
-        if (eew.isCancel) return true // 取消は常に通知
+        if (eew.isCancel) return true
         if (settings.eewWarningOnly && !eew.isWarn) return false
 
         val level = IntensityLevel.fromApiString(eew.MaxIntensity)
@@ -118,55 +179,42 @@ object NotificationHelper {
         return bitmap
     }
 
-    fun sendEewNotification(context: Context, eew: JmaEew, settings: AppSettingsState) {
+    suspend fun sendEewNotification(context: Context, eew: JmaEew, settings: AppSettingsState) {
         val codeType = EewCodeType.classify(eew)
         if (!isEnabledForEew(eew, settings)) return
 
         val level = IntensityLevel.fromApiString(eew.MaxIntensity)
         val isWarningTier = codeType == EewCodeType.WARNING || codeType == EewCodeType.EMERGENCY_WARNING
-        val channelId = when {
-            isWarningTier && settings.eewOverrideSilentMode -> CHANNEL_ID_WARNING_BYPASS
-            isWarningTier -> CHANNEL_ID_WARNING
-            else -> CHANNEL_ID_FORECAST
-        }
+        val serialLabel = "第${eew.Serial}報"
+        val warnAreaLabel = eew.WarnArea.orEmpty().map { extractPrefecture(it.Chiiki) }.distinct().joinToString("、")
 
-        val serialLabel = "第${eew.Serial}報${if (eew.isFinal) "（最終）" else ""}"
-
-        // 警報・特別警報のみ「○○で地震 強い揺れに警戒」の専用タイトルにする。
-        // 予報・取消は従来通り種別名+第N報のタイトルのまま。
-        val notificationTitle = if (isWarningTier) {
-            "${eew.Hypocenter}で地震 強い揺れに警戒"
-        } else {
-            "${codeType.displayName} $serialLabel"
-        }
-
-        // 警戒地域(都道府県)のリストは通知本文・読み上げの両方で使うため先に計算しておく
-        val warnPrefectures = if (eew.isWarn) {
-            eew.WarnArea.orEmpty().map { extractPrefecture(it.Chiiki) }.distinct()
-        } else {
-            emptyList()
-        }
-
-        val body = buildString {
-            // 警報・特別警報は「予想最大震度〇」から書き出し、深さ・M・警戒地域は従来通り続ける。
-            // 予報・取消は「○○で地震 推定震度は〇」のまま。
-            if (isWarningTier) {
-                if (eew.isAssumption) {
-                    append("予想最大震度${level.label}（PLUM法による推定震源）")
-                } else {
-                    append("予想最大震度${level.label} 深さ${eew.Depth.toInt()}km M${eew.Magunitude}")
-                }
-            } else {
-                if (eew.isAssumption) {
-                    append("${eew.Hypocenter}で地震 推定震度は${level.label}（PLUM法による推定震源）")
-                } else {
-                    append("${eew.Hypocenter}で地震 推定震度は${level.label} 深さ${eew.Depth.toInt()}km M${eew.Magunitude}")
+        val notificationTitle: String
+        val body: String
+        when {
+            codeType == EewCodeType.CANCEL -> {
+                notificationTitle = "緊急地震速報 (取消)$serialLabel"
+                body = "この緊急地震速報は取り消されました。"
+            }
+            isWarningTier -> {
+                notificationTitle = "${eew.Hypocenter}で地震 強い揺れに警戒 $serialLabel"
+                body = buildString {
+                    append("予想最大震度${level.label}、深さ${eew.Depth.toInt()}km、M${eew.Magunitude}")
+                    if (warnAreaLabel.isNotEmpty()) append("、強い揺れに警戒:$warnAreaLabel")
                 }
             }
-            if (warnPrefectures.isNotEmpty()) {
-                append("\n強い揺れに警戒:${warnPrefectures.joinToString("、")}")
+            else -> {
+                notificationTitle = "緊急地震速報 (予報)$serialLabel"
+                body = "${eew.Hypocenter}で地震 予想最大震度${level.label}、深さ${eew.Depth.toInt()}km、M${eew.Magunitude}"
             }
         }
+
+        val channelId = when (codeType) {
+            EewCodeType.EMERGENCY_WARNING -> CHANNEL_ID_EMERGENCY_WARNING
+            EewCodeType.WARNING -> CHANNEL_ID_WARNING
+            EewCodeType.CANCEL, EewCodeType.FORECAST -> CHANNEL_ID_FORECAST
+        }
+
+        val notifId = eew.EventID.hashCode()
 
         val notifBuilder = NotificationCompat.Builder(context, channelId)
             .setContentTitle(notificationTitle)
@@ -176,6 +224,7 @@ object NotificationHelper {
             .setPriority(if (isWarningTier) NotificationCompat.PRIORITY_MAX else NotificationCompat.PRIORITY_DEFAULT)
             .setCategory(NotificationCompat.CATEGORY_ALARM)
             .setAutoCancel(true)
+            .setContentIntent(buildContentIntent(context, notifId))
 
         if (settings.eewShowMapInNotification) {
             val mapBitmap = runCatching { WarnAreaMapRenderer.renderForEew(context, eew) }.getOrNull()
@@ -189,14 +238,14 @@ object NotificationHelper {
             }
         }
 
-        NotificationManagerCompat.from(context).notify(eew.EventID.hashCode(), notifBuilder.build())
+        NotificationManagerCompat.from(context).notify(notifId, notifBuilder.build())
+
+        if (codeType == EewCodeType.FORECAST || codeType == EewCodeType.CANCEL) {
+            playForecastSound(context, level)
+        }
 
         if (settings.eewTtsReadout) {
-            TtsAnnouncer.announceEew(
-                hypocenter = eew.Hypocenter,
-                maxIntensityLabel = level.formalLabel,
-                warnAreaLabel = warnPrefectures.takeIf { it.isNotEmpty() }?.joinToString("、")
-            )
+            TtsAnnouncer.announceEew(eew.Hypocenter, level.formalLabel, isWarningTier, warnAreaLabel.ifEmpty { null })
         }
     }
 
@@ -210,29 +259,33 @@ object NotificationHelper {
         return level.ordinal >= minLevel.ordinal
     }
 
-    fun sendQuakeNotification(context: Context, quake: QuakeCardState, settings: AppSettingsState) {
+    suspend fun sendQuakeNotification(context: Context, quake: QuakeCardState, settings: AppSettingsState) {
         if (!isEnabledForQuake(quake, settings)) return
 
         val level = IntensityLevel.fromP2pScale(quake.maxScale)
         val maxPoint = quake.points.maxByOrNull { it.scale ?: -1 }
         val areaLabel = maxPoint?.let { "${it.pref}${it.addr}" }
+        val notificationTitle = quake.issueType.displayName
 
         val body = buildString {
-            append("${quake.hypocenterName}で地震")
-            append(" 最大震度${level.label}")
+            append("${quake.hypocenterName}で地震がありました。")
+            append(" 最大震度は${level.label}")
             quake.depthKm?.let { append(" 深さ${it}km") }
             quake.magnitude?.let { append(" M$it") }
             areaLabel?.let { append("\n観測: $it") }
         }
 
+        val notifId = quake.id.hashCode()
+
         val notifBuilder = NotificationCompat.Builder(context, CHANNEL_ID_QUAKE)
-            .setContentTitle("地震情報")
+            .setContentTitle(notificationTitle)
             .setContentText(body)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setLargeIcon(buildIntensityIcon(context, level))
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setCategory(NotificationCompat.CATEGORY_EVENT)
             .setAutoCancel(true)
+            .setContentIntent(buildContentIntent(context, notifId))
 
         if (settings.quakeShowMapInNotification) {
             val pointLevels = quake.points.associate { it.pref to IntensityLevel.fromP2pScale(it.scale) }
@@ -243,32 +296,26 @@ object NotificationHelper {
                 notifBuilder.setStyle(
                     NotificationCompat.BigPictureStyle()
                         .bigPicture(mapBitmap)
-                        .setBigContentTitle("地震情報")
+                        .setBigContentTitle(notificationTitle)
                         .setSummaryText(body)
                 )
             }
         }
 
-        NotificationManagerCompat.from(context).notify(quake.id.hashCode(), notifBuilder.build())
+        NotificationManagerCompat.from(context).notify(notifId, notifBuilder.build())
 
         if (settings.quakeTtsReadout) {
-            TtsAnnouncer.announceQuake(
-                occurredAtLabel = quake.occurredAtLabel,
-                hypocenter = quake.hypocenterName,
-                depthKm = quake.depthKm,
-                magnitude = quake.magnitude,
-                maxIntensityLabel = level.formalLabel,
-                observedPrefecture = maxPoint?.pref
-            )
+            TtsAnnouncer.announceQuake(level.formalLabel, quake.hypocenterName, areaLabel)
         }
     }
 
     // ============================== 天気の定時通知 ==============================
 
-    /** 「アイコンに天気」「画像部分に時間ごと予報」のスタイルで、指定の時間帯ラベル付き通知を送る */
     fun sendWeatherNotification(context: Context, weather: WeatherUiState, settings: AppSettingsState, periodLabel: String) {
         val title = "${periodLabel}の天気 ${weather.location.name}"
         val body = "${weather.condition.label} ${weather.currentTemperature}℃（最高${weather.tempMaxToday}℃ / 最低${weather.tempMinToday}℃）"
+
+        val notifId = "weather_$periodLabel".hashCode()
 
         val notifBuilder = NotificationCompat.Builder(context, CHANNEL_ID_WEATHER)
             .setContentTitle(title)
@@ -276,6 +323,7 @@ object NotificationHelper {
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setAutoCancel(true)
+            .setContentIntent(buildContentIntent(context, notifId))
 
         if (settings.weatherNotifShowHourlyImage && weather.hourly.isNotEmpty()) {
             val bitmap = buildHourlyForecastBitmap(context, weather.hourly.take(6))
@@ -287,10 +335,9 @@ object NotificationHelper {
             )
         }
 
-        NotificationManagerCompat.from(context).notify("weather_$periodLabel".hashCode(), notifBuilder.build())
+        NotificationManagerCompat.from(context).notify(notifId, notifBuilder.build())
     }
 
-    /** 時間ごとの気温を横並びで描画した簡易バーチャート風Bitmap(通知の画像部分に使用) */
     private fun buildHourlyForecastBitmap(context: Context, points: List<com.sandolpin.weatherquake.data.weather.ForecastPoint>): Bitmap {
         val width = 720
         val height = 260
@@ -324,26 +371,23 @@ object NotificationHelper {
 
     // ============================== 通知テスト(設定画面用) ==============================
 
-    /** 端末側で通知が許可されているか(OFFの場合、notify()は例外を出さず黙って失敗する) */
     fun areNotificationsEnabled(context: Context): Boolean =
         NotificationManagerCompat.from(context).areNotificationsEnabled()
 
-    /** @return 実際に通知の送信を試みたらtrue。通知が許可されていない場合はfalseを返し、呼び出し側で案内する。 */
-    fun sendTestNotification(context: Context, kind: TestNotificationKind, settings: AppSettingsState): Boolean {
+    /**
+     * @return 実際に通知の送信を試みたらtrue。通知が許可されていない場合はfalseを返し、呼び出し側で案内する。
+     * EEW/地震情報のテストは地図生成(MapSnapshotter)を伴うためsuspend fun。
+     */
+    suspend fun sendTestNotification(context: Context, kind: TestNotificationKind, settings: AppSettingsState): Boolean {
         if (!areNotificationsEnabled(context)) return false
+        val relaxedEewSettings = settings.copy(
+            notifyOnEew = true, eewMinIntensityOrdinal = 1,
+            eewReceiveUnknownIntensity = true, eewWarningOnly = false
+        )
         when (kind) {
-            TestNotificationKind.EEW -> sendEewNotification(
-                context, sampleEew(),
-                settings.copy(notifyOnEew = true, eewMinIntensityOrdinal = 1, eewReceiveUnknownIntensity = true, eewWarningOnly = false)
-            )
-            TestNotificationKind.EEW_WARNING -> sendEewNotification(
-                context, sampleEewWarning(),
-                settings.copy(notifyOnEew = true, eewMinIntensityOrdinal = 1, eewReceiveUnknownIntensity = true, eewWarningOnly = false)
-            )
-            TestNotificationKind.EEW_EMERGENCY_WARNING -> sendEewNotification(
-                context, sampleEewEmergencyWarning(),
-                settings.copy(notifyOnEew = true, eewMinIntensityOrdinal = 1, eewReceiveUnknownIntensity = true, eewWarningOnly = false)
-            )
+            TestNotificationKind.EEW -> sendEewNotification(context, sampleEewForecast(), relaxedEewSettings)
+            TestNotificationKind.EEW_WARNING -> sendEewNotification(context, sampleEewWarning(), relaxedEewSettings)
+            TestNotificationKind.EEW_EMERGENCY_WARNING -> sendEewNotification(context, sampleEewEmergencyWarning(), relaxedEewSettings)
             TestNotificationKind.QUAKE -> sendQuakeNotification(
                 context, sampleQuake(),
                 settings.copy(notifyOnQuake = true, quakeMinIntensityOrdinal = 1)
@@ -357,40 +401,47 @@ object NotificationHelper {
         return true
     }
 
-    private fun sampleEew() = JmaEew(
-        Title = "緊急地震速報（テスト）", CodeType = "緊急地震速報", EventID = "test_event",
-        Serial = 6, AnnouncedTime = "2026/08/21 19:10:15", OriginTime = "2026/08/21 19:09:45",
-        Hypocenter = "熊本県熊本地方", Latitude = 32.8, Longitude = 130.7, Magunitude = 4.4, Depth = 10.0,
+    private fun sampleEewForecast() = JmaEew(
+        Title = "緊急地震速報（予報）", CodeType = "緊急地震速報", EventID = "test_event_forecast",
+        Serial = 3, AnnouncedTime = "2026/08/21 19:10:15", OriginTime = "2026/08/21 19:09:45",
+        Hypocenter = "茨城県南部", Latitude = 36.02, Longitude = 140.20, Magunitude = 4.4, Depth = 50.0,
         MaxIntensity = "3", isWarn = false, isFinal = false
     )
 
-    /** 通知テスト用: 警報(震度6弱未満)のサンプル */
     private fun sampleEewWarning() = JmaEew(
         Title = "緊急地震速報（警報）", CodeType = "緊急地震速報", EventID = "test_event_warning",
-        Serial = 3, AnnouncedTime = "2026/08/24 10:00:15", OriginTime = "2026/08/24 09:59:45",
-        Hypocenter = "茨城県沖", Latitude = 36.0, Longitude = 140.9, Magunitude = 6.2, Depth = 40.0,
-        MaxIntensity = "5強", isWarn = true, isFinal = false,
+        Serial = 6, AnnouncedTime = "2026/08/21 19:10:20", OriginTime = "2026/08/21 19:09:45",
+        Hypocenter = "茨城県南部", Latitude = 36.02, Longitude = 140.20, Magunitude = 6.0, Depth = 50.0,
+        MaxIntensity = "5弱", isWarn = true, isFinal = false,
         WarnArea = listOf(
-            WarnArea(Chiiki = "茨城県北部", Shindo1 = "5強"),
-            WarnArea(Chiiki = "栃木県南部", Shindo1 = "5弱")
+            WarnArea(Chiiki = "茨城県南部", Shindo1 = "5弱", Shindo2 = "5弱", Type = "警報", Arrive = true),
+            WarnArea(Chiiki = "群馬県南部", Shindo1 = "4", Shindo2 = "4", Type = "警報", Arrive = true),
+            WarnArea(Chiiki = "栃木県南部", Shindo1 = "5弱", Shindo2 = "5弱", Type = "警報", Arrive = true)
         )
     )
 
-    /** 通知テスト用: 特別警報(震度6弱以上)のサンプル */
     private fun sampleEewEmergencyWarning() = JmaEew(
-        Title = "緊急地震速報（特別警報）", CodeType = "緊急地震速報", EventID = "test_event_emergency",
-        Serial = 4, AnnouncedTime = "2026/08/24 10:05:20", OriginTime = "2026/08/24 10:04:50",
-        Hypocenter = "千葉県東方沖", Latitude = 35.6, Longitude = 140.9, Magunitude = 7.3, Depth = 30.0,
-        MaxIntensity = "6強", isWarn = true, isFinal = true,
+        Title = "緊急地震速報（警報）", CodeType = "緊急地震速報", EventID = "test_event_emergency",
+        Serial = 9, AnnouncedTime = "2026/08/21 19:10:25", OriginTime = "2026/08/21 19:09:45",
+        Hypocenter = "茨城県南部", Latitude = 36.02, Longitude = 140.20, Magunitude = 7.5, Depth = 50.0,
+        MaxIntensity = "7", isWarn = true, isFinal = true,
         WarnArea = listOf(
-            WarnArea(Chiiki = "千葉県北東部", Shindo1 = "6強"),
-            WarnArea(Chiiki = "茨城県南部", Shindo1 = "6弱")
+            WarnArea(Chiiki = "茨城県南部", Shindo1 = "7", Shindo2 = "7", Type = "警報", Arrive = true),
+            WarnArea(Chiiki = "群馬県南部", Shindo1 = "6強", Shindo2 = "6強", Type = "警報", Arrive = true),
+            WarnArea(Chiiki = "栃木県北部", Shindo1 = "6弱", Shindo2 = "6強", Type = "警報", Arrive = true),
+            WarnArea(Chiiki = "茨城県北部", Shindo1 = "6弱", Shindo2 = "6強", Type = "警報", Arrive = true),
+            WarnArea(Chiiki = "栃木県南部", Shindo1 = "6強", Shindo2 = "6弱", Type = "警報", Arrive = true)
         )
     )
 
     private fun sampleQuake() = QuakeCardState(
-        id = "test_quake", hypocenterName = "熊本県熊本地方", depthKm = 10, magnitude = 4.4,
-        occurredAtLabel = "8/21 19:09", latitude = 32.8, longitude = 130.7, maxScale = 30, points = emptyList()
+        id = "test_quake", hypocenterName = "茨城県南部", depthKm = 50, magnitude = 4.4,
+        occurredAtLabel = "8/21 19:09", latitude = 36.02, longitude = 140.20, maxScale = 30,
+        points = listOf(
+            com.sandolpin.weatherquake.data.quake.P2pPoint(pref = "茨城県", addr = "水戸市", scale = 30),
+            com.sandolpin.weatherquake.data.quake.P2pPoint(pref = "栃木県", addr = "宇都宮市", scale = 20)
+        ),
+        issueType = com.sandolpin.weatherquake.data.quake.QuakeIssueType.DETAIL_SCALE
     )
 
     private fun sampleWeather(): com.sandolpin.weatherquake.data.weather.WeatherUiState {

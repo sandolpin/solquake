@@ -29,7 +29,7 @@ data class CurrentBlock(
 /**
  * Open-Meteo Air Quality API (https://open-meteo.com/en/docs/air-quality-api) のレスポンス。
  * ヨーロッパ式AQI(european_aqi)とUVインデックスをここから取得する。
- * 気圧(hPa)・湿度(%)はメインのForecast APIのcurrentを使う。
+ * 気圧(hPa)はメインのForecast APIのcurrent.pressure_mslを使う。
  */
 data class AirQualityResponse(
     @SerializedName("current") val current: AirQualityCurrent?
@@ -86,8 +86,8 @@ data class WeatherLocation(
  * https://open-meteo.com/en/docs (WMO Weather code参照)
  */
 enum class WeatherCondition(val label: String) {
-    CLEAR("はれ"),
-    PARTLY_CLOUDY("はれ時々くもり"),
+    CLEAR("晴れ"),
+    PARTLY_CLOUDY("晴れ時々くもり"),
     CLOUDY("厚い雲"),
     FOG("霧"),
     DRIZZLE("小雨"),
@@ -141,5 +141,5 @@ data class WeatherUiState(
     val airQualityIndex: Int? = null,   // ヨーロッパ式AQI(0が最良、値が大きいほど汚れている)
     val uvIndex: Double? = null,
     val pressureHpa: Int? = null,
-    val humidityPercent: Int? = null    // 相対湿度(%)
+    val humidityPercent: Int? = null
 )

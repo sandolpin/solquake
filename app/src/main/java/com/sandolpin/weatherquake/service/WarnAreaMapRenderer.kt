@@ -1,253 +1,201 @@
 package com.sandolpin.weatherquake.service
 
 import android.content.Context
-import android.content.res.Configuration
 import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.Path
-import android.graphics.PointF
-import androidx.compose.ui.graphics.toArgb
-import androidx.core.graphics.ColorUtils
-import com.sandolpin.weatherquake.data.BoundingBox
-import com.sandolpin.weatherquake.data.GeoCoordinateUtil
+import android.util.Log
 import com.sandolpin.weatherquake.data.GeoJsonLoader
 import com.sandolpin.weatherquake.data.IntensityLevel
 import com.sandolpin.weatherquake.data.eew.JmaEew
-import kotlin.math.cos
-import kotlin.math.min
+import com.sandolpin.weatherquake.map.EpicenterIconFactory
+import com.sandolpin.weatherquake.map.MapCameraBoundsHelper
+import com.sandolpin.weatherquake.map.MapLibreStyleFactory
+import com.sandolpin.weatherquake.map.isValidLatLng
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import org.maplibre.android.geometry.LatLng
+import org.maplibre.android.snapshotter.MapSnapshotter
+import kotlin.coroutines.resume
 
 /**
  * 通知(NotificationCompat.BigPictureStyle)に添付する地図画像を、
- * Compose版の地図(WarnAreaMap)と同じ見た目のロジックでandroid.graphics.Bitmapとして描画する。
- * NotificationHelperはCompose UIツリーの外(Service/バックグラウンド)から呼ばれるため、
- * ここでは素のandroid.graphics APIで描画する。
+ * MapLibreのMapSnapshotter(画面表示せずBitmapだけを生成するAPI)で描画する。
+ *
+ * [重要] MapSnapshotterはメインスレッド(Looperのあるスレッド)からの生成・start()呼び出しを
+ * 前提としているAPIのため、このオブジェクトの関数はすべてsuspend funにしてある。
+ * 呼び出し元(NotificationHelper)もsuspend化する必要がある。
+ *
+ * 震源マーカー(×印/○印)はMapSnapshotter単体では重ねられないため、
+ * スナップショット取得後にandroid.graphics.Canvasで自前合成している
+ * (点滅は不要な静止画のため、ここでは常に不透明で描く)。
+ *
+ * [震源マーカーのサイズについて]
+ * 通知画像は小さいため、EpicenterIconFactory側のビットマップ拡大に合わせて
+ * 合成先のサイズ(dstSize)も64px→96pxに拡大し、通知上でも視認しやすくしている。
  */
 object WarnAreaMapRenderer {
 
     private const val MAP_WIDTH_PX = 720
     private const val MAP_HEIGHT_PX = 360
+    private const val SNAPSHOT_TIMEOUT_MS = 8000L
+    private const val TAG = "WarnAreaMapRenderer"
 
-    /** 緊急地震速報(EEW)用: 警戒エリア・震源位置をもとに地図Bitmapを生成する */
-    fun renderForEew(context: Context, eew: JmaEew): Bitmap? {
+    suspend fun renderForEew(context: Context, eew: JmaEew): Bitmap? {
         val epicenterLon = eew.Longitude
         val epicenterLat = eew.Latitude
         val warnAreas = eew.WarnArea.orEmpty()
-
         if (epicenterLon == 0.0 && epicenterLat == 0.0 && warnAreas.isEmpty()) return null
 
         val intensityByName = LinkedHashMap<String, IntensityLevel>()
         warnAreas.forEach { area ->
             intensityByName.putIfAbsent(area.Chiiki, IntensityLevel.fromApiString(area.Shindo1))
         }
-        return renderCore(context, intensityByName, epicenterLon, epicenterLat, eew.isAssumption)
+
+        return renderCore(
+            context = context,
+            regionIntensityByName = intensityByName,
+            epicenterLon = epicenterLon,
+            epicenterLat = epicenterLat,
+            isAssumption = eew.isAssumption
+        )
     }
 
-    /** 地震情報(P2P)用: 観測地点の震度をもとに地図Bitmapを生成する */
-    fun renderForQuake(
+    suspend fun renderForQuake(
         context: Context,
         epicenterLon: Double,
         epicenterLat: Double,
         pointNameToScale: Map<String, IntensityLevel>
     ): Bitmap? {
         if (epicenterLon == 0.0 && epicenterLat == 0.0 && pointNameToScale.isEmpty()) return null
-        return renderCore(context, LinkedHashMap(pointNameToScale), epicenterLon, epicenterLat, isAssumption = false)
+        return renderCore(
+            context = context,
+            regionIntensityByName = LinkedHashMap(pointNameToScale),
+            epicenterLon = epicenterLon,
+            epicenterLat = epicenterLat,
+            isAssumption = false
+        )
     }
 
-    private fun renderCore(
+    private suspend fun renderCore(
         context: Context,
-        intensityByName: LinkedHashMap<String, IntensityLevel>,
+        regionIntensityByName: Map<String, IntensityLevel>,
         epicenterLon: Double,
         epicenterLat: Double,
         isAssumption: Boolean
-    ): Bitmap? {
-        val prepared = try {
-            GeoJsonLoader.preparedFeatures(context)
-        } catch (e: Exception) {
-            return null
-        }
+    ): Bitmap? = try {
+        // P2P地震情報API等が「震源不明」を-200のようなセンチネル値で表すことがあるため、
+        // 地図座標として使う前に必ず範囲チェックする(そのままLatLngに渡すとクラッシュする)。
+        val hasValidEpicenter = isValidLatLng(epicenterLat, epicenterLon)
+        val boundsEpicenterLat = if (hasValidEpicenter) epicenterLat else 36.0
+        val boundsEpicenterLon = if (hasValidEpicenter) epicenterLon else 138.0
 
-        val names = intensityByName.keys.toList()
-        val matchedFeatures = prepared.filter { it.name in names }
-        val colored = matchedFeatures.mapNotNull { feature ->
-            if (feature.polygons.isEmpty()) return@mapNotNull null
-            val level = intensityByName[feature.name] ?: IntensityLevel.UNKNOWN
-            feature.polygons to level.bgColor.toArgb()
-        }
+        val bounds = MapCameraBoundsHelper.compute(
+            context = context,
+            loader = GeoJsonLoader.region,
+            coloredNames = regionIntensityByName.keys,
+            epicenterLon = boundsEpicenterLon,
+            epicenterLat = boundsEpicenterLat
+        )
 
-        val coloredBbox = GeoCoordinateUtil.boundingBox(colored.flatMap { it.first })
-        val bbox = if (coloredBbox != null) {
-            BoundingBox(
-                minLon = minOf(coloredBbox.minLon, epicenterLon),
-                maxLon = maxOf(coloredBbox.maxLon, epicenterLon),
-                minLat = minOf(coloredBbox.minLat, epicenterLat),
-                maxLat = maxOf(coloredBbox.maxLat, epicenterLat)
-            )
+        val styleBuilder = MapLibreStyleFactory.build(context, regionIntensityByName)
+
+        val rawSnapshot = withTimeoutOrNull(SNAPSHOT_TIMEOUT_MS) {
+            takeSnapshot(context, styleBuilder, bounds)
+        }
+        if (rawSnapshot == null) {
+            Log.w(TAG, "スナップショット取得に失敗またはタイムアウトしました(${SNAPSHOT_TIMEOUT_MS}ms)")
+            null
+        } else if (!hasValidEpicenter) {
+            // 震源座標が不明な場合は震源マーカーを合成せず、スナップショットのBitmapをそのまま返す
+            rawSnapshot.bitmap
         } else {
-            val soloSpanDegrees = 1.2
-            BoundingBox(
-                minLon = epicenterLon - soloSpanDegrees, maxLon = epicenterLon + soloSpanDegrees,
-                minLat = epicenterLat - soloSpanDegrees, maxLat = epicenterLat + soloSpanDegrees
+            compositeEpicenterMarker(
+                snapshotResult = rawSnapshot,
+                epicenterLon = epicenterLon,
+                epicenterLat = epicenterLat,
+                isAssumption = isAssumption
             )
         }
-
-        val lonPad = (bbox.maxLon - bbox.minLon).coerceAtLeast(0.08) * 0.8 + 0.3
-        val latPad = (bbox.maxLat - bbox.minLat).coerceAtLeast(0.08) * 0.8 + 0.3
-        val viewMinLon = bbox.minLon - lonPad
-        val viewMaxLon = bbox.maxLon + lonPad
-        val viewMinLat = bbox.minLat - latPad
-        val viewMaxLat = bbox.maxLat + latPad
-
-        val matchedNameSet = matchedFeatures.map { it.name }.toSet()
-        val basePolygons = prepared.mapNotNull { feature ->
-            if (feature.name in matchedNameSet) return@mapNotNull null
-            if (feature.polygons.isEmpty()) return@mapNotNull null
-            val featureBbox = feature.bbox ?: return@mapNotNull null
-            val intersects = featureBbox.minLon <= viewMaxLon && featureBbox.maxLon >= viewMinLon &&
-                    featureBbox.minLat <= viewMaxLat && featureBbox.maxLat >= viewMinLat
-            if (!intersects) return@mapNotNull null
-            feature.polygons
-        }.flatten()
-
-        return draw(bbox, basePolygons, colored, epicenterLon, epicenterLat, isAssumption, isSystemDarkMode(context))
+    } catch (e: Exception) {
+        Log.e(TAG, "地図Bitmapの生成中に例外が発生しました", e)
+        null
     }
 
-    private fun draw(
-        bbox: BoundingBox,
-        basePolygons: List<FloatArray>,
-        coloredPolygons: List<Pair<List<FloatArray>, Int>>,
+    /**
+     * MapSnapshotterはメインスレッドで生成・start()する必要があるため、
+     * withContext(Dispatchers.Main)に切り替えた上でsuspendCancellableCoroutineで
+     * コールバックAPIを橋渡しする。
+     */
+    private suspend fun takeSnapshot(
+        context: Context,
+        styleBuilder: org.maplibre.android.maps.Style.Builder,
+        bounds: org.maplibre.android.geometry.LatLngBounds
+    ): SnapshotResult? = withContext(Dispatchers.Main) {
+        suspendCancellableCoroutine<SnapshotResult?> { continuation ->
+            val options = MapSnapshotter.Options(MAP_WIDTH_PX, MAP_HEIGHT_PX)
+                .withStyleBuilder(styleBuilder)
+                .withRegion(bounds)
+                .withLogo(false)
+
+            val snapshotter = MapSnapshotter(context, options)
+
+            // [要検証] start()の引数(SnapshotReadyCallback / ErrorHandler)はJavaのfunctional
+            // interfaceなのでKotlinからラムダで渡せるはずだが、SDKバージョンによっては
+            // object : MapSnapshotter.SnapshotReadyCallback { override fun onSnapshotReady(...) }
+            // のような明示的な実装が必要になることがある。ビルドエラーが出た場合はここを確認。
+            snapshotter.start(
+                { snapshot ->
+                    if (continuation.isActive) {
+                        continuation.resume(SnapshotResult(snapshot.bitmap, snapshot))
+                    }
+                },
+                { error ->
+                    Log.w(TAG, "MapSnapshotterがエラーを返しました: $error")
+                    if (continuation.isActive) continuation.resume(null)
+                }
+            )
+
+            continuation.invokeOnCancellation {
+                runCatching { snapshotter.cancel() }
+            }
+        }
+    }
+
+    /**
+     * MapSnapshotterで得たBitmapの上に、震源マーカー(×印/○印)を合成する。
+     * MapSnapshot.pixelForLatLng()を使って、緯度経度→Bitmap上のピクセル座標に変換する。
+     */
+    private fun compositeEpicenterMarker(
+        snapshotResult: SnapshotResult,
         epicenterLon: Double,
         epicenterLat: Double,
-        isAssumption: Boolean,
-        isDark: Boolean
+        isAssumption: Boolean
     ): Bitmap {
-        val bitmap = Bitmap.createBitmap(MAP_WIDTH_PX, MAP_HEIGHT_PX, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bitmap)
+        val bitmap = snapshotResult.bitmap.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = android.graphics.Canvas(bitmap)
 
-        val backgroundColor = if (isDark) Color.parseColor("#2C2C2C") else Color.parseColor("#F0F0F0")
-        canvas.drawColor(backgroundColor)
+        val point = runCatching {
+            snapshotResult.snapshot.pixelForLatLng(LatLng(epicenterLat, epicenterLon))
+        }.getOrNull()
 
-        val baseFillColor = if (isDark) Color.parseColor("#3A3A3A") else Color.WHITE
-        val borderColor = if (isDark) Color.parseColor("#8A8A8A") else Color.parseColor("#9E9E9E")
-
-        val latCorrection = cos(Math.toRadians(bbox.centerLat)).coerceAtLeast(0.3)
-        val paddingRatio = 0.35
-        val rawLonSpan = (bbox.maxLon - bbox.minLon).coerceAtLeast(0.08)
-        val rawLatSpan = (bbox.maxLat - bbox.minLat).coerceAtLeast(0.08)
-        val lonSpanMeters = rawLonSpan * latCorrection
-        val latSpanMeters = rawLatSpan
-        val spanMeters = maxOf(lonSpanMeters, latSpanMeters) * (1 + paddingRatio)
-        val scale = (min(MAP_WIDTH_PX, MAP_HEIGHT_PX) / spanMeters).toFloat()
-
-        fun project(lon: Double, lat: Double): PointF {
-            val xMeters = (lon - bbox.centerLon) * latCorrection
-            val yMeters = lat - bbox.centerLat
-            val x = MAP_WIDTH_PX / 2f + xMeters.toFloat() * scale
-            val y = MAP_HEIGHT_PX / 2f - yMeters.toFloat() * scale
-            return PointF(x, y)
+        if (point != null) {
+            val icon = if (isAssumption) EpicenterIconFactory.assumptionIcon() else EpicenterIconFactory.crossIcon()
+            val dstSize = 96
+            val dst = android.graphics.RectF(
+                point.x - dstSize / 2f,
+                point.y - dstSize / 2f,
+                point.x + dstSize / 2f,
+                point.y + dstSize / 2f
+            )
+            canvas.drawBitmap(icon, null, dst, null)
         }
-
-        fun ringToPath(ring: FloatArray): Path? {
-            val pointCount = ring.size / 2
-            if (pointCount < 3) return null
-            val path = Path()
-            val start = project(ring[0].toDouble(), ring[1].toDouble())
-            path.moveTo(start.x, start.y)
-            var i = 1
-            while (i < pointCount) {
-                val p = project(ring[i * 2].toDouble(), ring[i * 2 + 1].toDouble())
-                path.lineTo(p.x, p.y)
-                i++
-            }
-            path.close()
-            return path
-        }
-
-        val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-        val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
-
-        basePolygons.forEach { ring ->
-            val path = ringToPath(ring) ?: return@forEach
-            fillPaint.color = baseFillColor
-            canvas.drawPath(path, fillPaint)
-            strokePaint.color = borderColor
-            strokePaint.strokeWidth = 2f
-            canvas.drawPath(path, strokePaint)
-        }
-
-        coloredPolygons.forEach { (polygons, colorInt) ->
-            polygons.forEach { ring ->
-                val path = ringToPath(ring) ?: return@forEach
-                fillPaint.color = ColorUtils.setAlphaComponent(colorInt, (0.85f * 255).toInt())
-                canvas.drawPath(path, fillPaint)
-                strokePaint.color = Color.WHITE
-                strokePaint.strokeWidth = 3.5f
-                canvas.drawPath(path, strokePaint)
-            }
-        }
-
-        val markerCenter = project(epicenterLon, epicenterLat)
-        drawEpicenterMarker(canvas, markerCenter, isAssumption)
 
         return bitmap
     }
 
-    private fun drawEpicenterMarker(canvas: Canvas, center: PointF, isAssumption: Boolean) {
-        val shadowDx = 3f
-        val shadowDy = 3.5f
-        val shadowColor = ColorUtils.setAlphaComponent(Color.BLACK, (0.4f * 255).toInt())
-        val outlineColor = Color.WHITE
-        val fillColor = Color.parseColor("#E53935")
-
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-
-        if (isAssumption) {
-            val radius = 16f
-            paint.style = Paint.Style.FILL
-            paint.color = shadowColor
-            canvas.drawCircle(center.x + shadowDx, center.y + shadowDy, radius, paint)
-
-            paint.style = Paint.Style.STROKE
-            paint.strokeWidth = 5.5f
-            paint.color = outlineColor
-            canvas.drawCircle(center.x, center.y, radius, paint)
-
-            paint.strokeWidth = 4.5f
-            paint.color = fillColor
-            canvas.drawCircle(center.x, center.y, radius - 2.75f, paint)
-        } else {
-            // 通知の地図画像(720x360px)に対して以前は×印が大きすぎたため、約半分のサイズに縮小した
-            val armLength = 20f
-            val outlineWidth = 11f
-            val fillWidth = 6f
-
-            fun crossPath(cx: Float, cy: Float): Path = Path().apply {
-                moveTo(cx - armLength, cy - armLength)
-                lineTo(cx + armLength, cy + armLength)
-                moveTo(cx + armLength, cy - armLength)
-                lineTo(cx - armLength, cy + armLength)
-            }
-
-            paint.style = Paint.Style.STROKE
-            paint.strokeCap = Paint.Cap.ROUND
-
-            paint.strokeWidth = fillWidth
-            paint.color = shadowColor
-            canvas.drawPath(crossPath(center.x + shadowDx, center.y + shadowDy), paint)
-
-            paint.strokeWidth = outlineWidth
-            paint.color = outlineColor
-            canvas.drawPath(crossPath(center.x, center.y), paint)
-
-            paint.strokeWidth = fillWidth
-            paint.color = fillColor
-            canvas.drawPath(crossPath(center.x, center.y), paint)
-        }
-    }
-
-    private fun isSystemDarkMode(context: Context): Boolean {
-        val nightModeFlags = context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
-        return nightModeFlags == Configuration.UI_MODE_NIGHT_YES
-    }
+    private data class SnapshotResult(
+        val bitmap: Bitmap,
+        val snapshot: org.maplibre.android.snapshotter.MapSnapshot
+    )
 }

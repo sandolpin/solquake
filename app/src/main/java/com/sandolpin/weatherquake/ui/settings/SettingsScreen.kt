@@ -14,6 +14,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.sandolpin.weatherquake.data.settings.CardStyle
 import com.sandolpin.weatherquake.data.settings.DarkModeOption
@@ -126,11 +127,6 @@ fun SettingsScreen(
         )
         SettingsSwitchRow("予想震度がわかっていない速報も受信", settings.eewReceiveUnknownIntensity) { viewModel.update { s -> s.copy(eewReceiveUnknownIntensity = it) } }
         SettingsSwitchRow("震源・強い揺れが予想される地域の地図を表示", settings.eewShowMapInNotification) { viewModel.update { s -> s.copy(eewShowMapInNotification = it) } }
-        SettingsSwitchRow(
-            "警報発表時はサイレントモードでも通知する",
-            settings.eewOverrideSilentMode,
-            subtitle = "端末の「マナーモードの例外を許可」設定が必要な場合があります"
-        ) { viewModel.update { s -> s.copy(eewOverrideSilentMode = it) } }
         SettingsSwitchRow("予想震度・対象地域を音声で読み上げる", settings.eewTtsReadout) { viewModel.update { s -> s.copy(eewTtsReadout = it) } }
 
         // --- 通知設定(地震情報) ---
@@ -148,26 +144,39 @@ fun SettingsScreen(
 
         // --- 通知テスト ---
         SettingsSectionTitle("通知テスト")
-        Column {
-            OutlinedButton(onClick = { viewModel.sendTestNotification(TestNotificationKind.WEATHER) }, modifier = Modifier.fillMaxSize()) {
-                Text("天気の通知をテスト")
-            }
+        val notificationTestMessage by viewModel.notificationTestMessage.collectAsState()
+        OutlinedButton(onClick = { viewModel.sendTestNotification(TestNotificationKind.WEATHER) }, modifier = Modifier.fillMaxSize()) {
+            Text("天気の通知をテスト")
         }
         androidx.compose.foundation.layout.Spacer(Modifier.padding(4.dp))
         OutlinedButton(onClick = { viewModel.sendTestNotification(TestNotificationKind.EEW) }, modifier = Modifier.fillMaxSize()) {
-            Text("緊急地震速報の通知をテスト")
+            Text("緊急地震速報(予報)の通知をテスト")
         }
         androidx.compose.foundation.layout.Spacer(Modifier.padding(4.dp))
         OutlinedButton(onClick = { viewModel.sendTestNotification(TestNotificationKind.EEW_WARNING) }, modifier = Modifier.fillMaxSize()) {
-            Text("緊急地震速報（警報）の通知をテスト")
+            Text("緊急地震速報(警報)の通知をテスト")
         }
         androidx.compose.foundation.layout.Spacer(Modifier.padding(4.dp))
         OutlinedButton(onClick = { viewModel.sendTestNotification(TestNotificationKind.EEW_EMERGENCY_WARNING) }, modifier = Modifier.fillMaxSize()) {
-            Text("緊急地震速報（特別警報）の通知をテスト")
+            Text("緊急地震速報(特別警報)の通知をテスト")
         }
         androidx.compose.foundation.layout.Spacer(Modifier.padding(4.dp))
         OutlinedButton(onClick = { viewModel.sendTestNotification(TestNotificationKind.QUAKE) }, modifier = Modifier.fillMaxSize()) {
             Text("地震情報の通知をテスト")
+        }
+        notificationTestMessage?.let { message ->
+            Text(message, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 8.dp))
+        }
+        val context = androidx.compose.ui.platform.LocalContext.current
+        OutlinedButton(
+            onClick = {
+                val intent = android.content.Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                    .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName)
+                context.startActivity(intent)
+            },
+            modifier = Modifier.fillMaxSize().padding(top = 8.dp)
+        ) {
+            Text("端末の通知設定を開く")
         }
 
         // --- その他 ---
@@ -186,6 +195,24 @@ fun SettingsScreen(
                 modifier = Modifier.padding(top = 8.dp)
             )
         }
+
+        // --- ライセンス ---
+        // 地図描画にMapLibre(オープンソースの地図描画ライブラリ)を使用している旨を明記する。
+        // 地図上のロゴ/アトリビューション表示は非表示にしているため(WarnAreaMap.kt等参照)、
+        // その代わりにここで固定テキストとして表示している。
+        SettingsSectionTitle("ライセンス")
+        Text(
+            "地図の描画には、オープンソースの地図描画ライブラリ「MapLibre」(MapLibre Native, BSD 2-Clauseライセンス)を使用しています。",
+            fontSize = 13.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 8.dp)
+        )
+        Text(
+            "地図データは、気象庁の地方予報区・市町村区分に基づく境界データを使用しています。",
+            fontSize = 13.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 4.dp)
+        )
 
         androidx.compose.foundation.layout.Spacer(Modifier.padding(24.dp))
     }

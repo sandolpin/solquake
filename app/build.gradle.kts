@@ -18,7 +18,10 @@ android {
         minSdk = 31
         targetSdk = 35
         versionCode = 1
-        versionName = "1.1"
+        versionName = "0.2.5"
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
     }
 
     buildFeatures {
@@ -89,4 +92,10 @@ dependencies {
 
     // --- 位置情報(天気画面の現在地取得) ---
     implementation("com.google.android.gms:play-services-location:21.3.0")
+    // MapLibre本体(2026年8月時点の最新版。ビルド時にバージョンが古くなっていたら
+// https://mvnrepository.com/artifact/org.maplibre.gl/android-sdk で最新を確認してください)
+    implementation("org.maplibre.gl:android-sdk:13.6.0")
+
+// Symbol(震源マーカー)を扱うためのアノテーションプラグイン
+    implementation("org.maplibre.gl:android-plugin-annotation-v9:3.0.2")
 }

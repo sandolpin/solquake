@@ -7,6 +7,9 @@ import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import com.sandolpin.weatherquake.data.weather.WeatherLocation
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -34,6 +37,13 @@ data class AppSettingsState(
     val weatherCardOpacity: Float = 0.4f, // 0.0〜0.8
     val temperatureFont: TemperatureFontStyle = TemperatureFontStyle.RECOMMENDED,
 
+    // 天気画面: 地点検索履歴・ホーム画面に表示する地域(複数)
+    // searchHistory  : これまでに検索したことがある地点すべて(検索シートの「履歴」に表示)
+    // homeLocations  : ホーム画面でスワイプ表示する地点(順序を保持。先頭 = 起動時のデフォルト地点)
+    //                   空の場合はWeatherViewModel側で「前橋市」を仮のデフォルトとして扱う。
+    val searchHistory: List<WeatherLocation> = emptyList(),
+    val homeLocations: List<WeatherLocation> = emptyList(),
+
     // 地震画面設定
     val intensityColorContrast: IntensityColorContrast = IntensityColorContrast.DEFAULT,
     val hideUnknownDepthMagnitude: Boolean = false,
@@ -52,7 +62,6 @@ data class AppSettingsState(
     val eewMinIntensityOrdinal: Int = 1, // IntensityLevel.ordinal (1=ONEに相当させたい場合はUI側で+1補正)
     val eewReceiveUnknownIntensity: Boolean = true,
     val eewShowMapInNotification: Boolean = true,
-    val eewOverrideSilentMode: Boolean = false,
     val eewTtsReadout: Boolean = false,
 
     // 通知設定(地震情報)
@@ -71,6 +80,10 @@ data class AppSettingsState(
  */
 class SettingsRepository(private val context: Context) {
 
+    // 検索履歴・ホーム地点(どちらもList<WeatherLocation>)はDataStore Preferencesが直接扱えない型のため、
+    // Gsonで1本のJSON文字列にシリアライズしてstringPreferencesKeyに保存する。
+    private val gson = Gson()
+
     private object Keys {
         val DARK_MODE = stringPreferencesKey("dark_mode")
 
@@ -81,6 +94,9 @@ class SettingsRepository(private val context: Context) {
         val WEATHER_CARD_STYLE = stringPreferencesKey("weather_card_style")
         val WEATHER_CARD_OPACITY = floatPreferencesKey("weather_card_opacity")
         val TEMPERATURE_FONT = stringPreferencesKey("temperature_font")
+
+        val SEARCH_HISTORY_JSON = stringPreferencesKey("search_history_json")
+        val HOME_LOCATIONS_JSON = stringPreferencesKey("home_locations_json")
 
         val INTENSITY_CONTRAST = stringPreferencesKey("intensity_contrast")
         val HIDE_UNKNOWN = booleanPreferencesKey("hide_unknown_depth_magnitude")
@@ -97,7 +113,6 @@ class SettingsRepository(private val context: Context) {
         val EEW_MIN_INTENSITY = intPreferencesKey("eew_min_intensity")
         val EEW_RECEIVE_UNKNOWN = booleanPreferencesKey("eew_receive_unknown")
         val EEW_SHOW_MAP = booleanPreferencesKey("eew_show_map")
-        val EEW_OVERRIDE_SILENT = booleanPreferencesKey("eew_override_silent")
         val EEW_TTS = booleanPreferencesKey("eew_tts")
 
         val NOTIFY_ON_QUAKE = booleanPreferencesKey("notify_on_quake")
@@ -119,6 +134,9 @@ class SettingsRepository(private val context: Context) {
             weatherCardOpacity = prefs[Keys.WEATHER_CARD_OPACITY] ?: 0.4f,
             temperatureFont = prefs[Keys.TEMPERATURE_FONT]?.let { runCatching { TemperatureFontStyle.valueOf(it) }.getOrNull() } ?: TemperatureFontStyle.RECOMMENDED,
 
+            searchHistory = prefs[Keys.SEARCH_HISTORY_JSON]?.let { json -> parseLocationList(json) } ?: emptyList(),
+            homeLocations = prefs[Keys.HOME_LOCATIONS_JSON]?.let { json -> parseLocationList(json) } ?: emptyList(),
+
             intensityColorContrast = prefs[Keys.INTENSITY_CONTRAST]?.let { runCatching { IntensityColorContrast.valueOf(it) }.getOrNull() } ?: IntensityColorContrast.DEFAULT,
             hideUnknownDepthMagnitude = prefs[Keys.HIDE_UNKNOWN] ?: false,
 
@@ -134,7 +152,6 @@ class SettingsRepository(private val context: Context) {
             eewMinIntensityOrdinal = prefs[Keys.EEW_MIN_INTENSITY] ?: 1,
             eewReceiveUnknownIntensity = prefs[Keys.EEW_RECEIVE_UNKNOWN] ?: true,
             eewShowMapInNotification = prefs[Keys.EEW_SHOW_MAP] ?: true,
-            eewOverrideSilentMode = prefs[Keys.EEW_OVERRIDE_SILENT] ?: false,
             eewTtsReadout = prefs[Keys.EEW_TTS] ?: false,
 
             notifyOnQuake = prefs[Keys.NOTIFY_ON_QUAKE] ?: true,
@@ -145,6 +162,11 @@ class SettingsRepository(private val context: Context) {
             apiPollingIntervalSeconds = prefs[Keys.API_POLLING_INTERVAL] ?: 5
         )
     }
+
+    private fun parseLocationList(json: String): List<WeatherLocation>? = runCatching {
+        val type = object : TypeToken<List<WeatherLocation>>() {}.type
+        gson.fromJson<List<WeatherLocation>>(json, type)
+    }.getOrNull()
 
     suspend fun update(transform: (AppSettingsState) -> AppSettingsState) {
         // 現在値を読んでから更新後の値をまとめて書き込む(項目ごとの個別update関数を量産しないための共通口)
@@ -159,6 +181,9 @@ class SettingsRepository(private val context: Context) {
             prefs[Keys.WEATHER_CARD_STYLE] = updated.weatherCardStyle.name
             prefs[Keys.WEATHER_CARD_OPACITY] = updated.weatherCardOpacity
             prefs[Keys.TEMPERATURE_FONT] = updated.temperatureFont.name
+
+            prefs[Keys.SEARCH_HISTORY_JSON] = gson.toJson(updated.searchHistory)
+            prefs[Keys.HOME_LOCATIONS_JSON] = gson.toJson(updated.homeLocations)
 
             prefs[Keys.INTENSITY_CONTRAST] = updated.intensityColorContrast.name
             prefs[Keys.HIDE_UNKNOWN] = updated.hideUnknownDepthMagnitude
@@ -175,7 +200,6 @@ class SettingsRepository(private val context: Context) {
             prefs[Keys.EEW_MIN_INTENSITY] = updated.eewMinIntensityOrdinal
             prefs[Keys.EEW_RECEIVE_UNKNOWN] = updated.eewReceiveUnknownIntensity
             prefs[Keys.EEW_SHOW_MAP] = updated.eewShowMapInNotification
-            prefs[Keys.EEW_OVERRIDE_SILENT] = updated.eewOverrideSilentMode
             prefs[Keys.EEW_TTS] = updated.eewTtsReadout
 
             prefs[Keys.NOTIFY_ON_QUAKE] = updated.notifyOnQuake
@@ -184,6 +208,49 @@ class SettingsRepository(private val context: Context) {
             prefs[Keys.QUAKE_TTS] = updated.quakeTtsReadout
 
             prefs[Keys.API_POLLING_INTERVAL] = updated.apiPollingIntervalSeconds
+        }
+    }
+
+    /** 検索した地点を履歴の先頭に追加する(同名地点は除去してから追加し、最大12件まで保持) */
+    suspend fun addSearchHistory(location: WeatherLocation) {
+        update { current ->
+            val deduped = current.searchHistory.filterNot { it.name == location.name }
+            current.copy(searchHistory = (listOf(location) + deduped).take(12))
+        }
+    }
+
+    /**
+     * ホーム画面に表示する地点の一覧に追加/削除する。
+     * 一覧が空(=まだカスタマイズしていない、前橋市が仮デフォルトとして使われている)状態から
+     * 追加する場合は、fallbackWhenEmptyを先に一覧へ含めてから追加する。
+     * こうしないと「初めて1件をホームに追加した瞬間、それまで仮表示されていた前橋市が消える」
+     * という直感に反する挙動になってしまう。
+     */
+    suspend fun setHomeLocationIncluded(location: WeatherLocation, included: Boolean, fallbackWhenEmpty: WeatherLocation) {
+        update { current ->
+            val base = current.homeLocations.ifEmpty { listOf(fallbackWhenEmpty) }
+            val without = base.filterNot { it.name == location.name }
+            val updatedList = if (included) without + location else without
+            current.copy(homeLocations = updatedList)
+        }
+    }
+
+    /** 指定した地点をホーム地点一覧の先頭(=起動時のデフォルト)に移動する。まだ一覧に無ければ先頭に新規追加する。 */
+    suspend fun pinAsDefaultHomeLocation(location: WeatherLocation, fallbackWhenEmpty: WeatherLocation) {
+        update { current ->
+            val base = current.homeLocations.ifEmpty { listOf(fallbackWhenEmpty) }
+            val without = base.filterNot { it.name == location.name }
+            current.copy(homeLocations = listOf(location) + without)
+        }
+    }
+
+    /** 履歴からも、ホーム画面表示一覧からも、指定した地点を完全に削除する */
+    suspend fun removeLocationEverywhere(location: WeatherLocation) {
+        update { current ->
+            current.copy(
+                searchHistory = current.searchHistory.filterNot { it.name == location.name },
+                homeLocations = current.homeLocations.filterNot { it.name == location.name }
+            )
         }
     }
 }

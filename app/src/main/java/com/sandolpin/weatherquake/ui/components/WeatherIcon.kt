@@ -1,6 +1,7 @@
 package com.sandolpin.weatherquake.ui.components
 
 import androidx.compose.animation.Crossfade
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.size
@@ -28,6 +29,10 @@ import com.sandolpin.weatherquake.ui.theme.DayPhase
  * デザイン画像の「角丸ボックス+アイコン」を再現する天気アイコン。
  * 天気種別と時間帯(昼/夜)の組み合わせで背景色・アイコンを切り替え、
  * 切り替わり時はCrossfadeで滑らかに繋ぐ。
+ *
+ * 背景色の塗りつぶしだけだと、動的背景(WeatherBackground)の上でシルエットが
+ * ぼやけて見えることがあるため、白の半透明な縁取り(border)を付けて
+ * 正方形の輪郭をはっきりさせている。
  */
 @Composable
 fun WeatherIcon(
@@ -40,7 +45,8 @@ fun WeatherIcon(
     Surface(
         modifier = modifier.size(size),
         shape = RoundedCornerShape(size / 4),
-        color = bgColor
+        color = bgColor,
+        border = BorderStroke(2.dp, Color.White.copy(alpha = 0.55f))
     ) {
         Crossfade(targetState = icon, label = "weatherIcon") { currentIcon ->
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

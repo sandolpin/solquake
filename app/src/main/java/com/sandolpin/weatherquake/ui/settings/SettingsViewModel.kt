@@ -44,12 +44,19 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    /**
+     * NotificationHelper.sendTestNotificationは地図生成(MapSnapshotter)を伴うためsuspend funになった。
+     * viewModelScope.launchで包むことで、呼び出し側(SettingsScreen)のonClickは従来通り
+     * 通常の関数呼び出しのままで使える。
+     */
     fun sendTestNotification(kind: TestNotificationKind) {
-        val sent = NotificationHelper.sendTestNotification(getApplication(), kind, _settings.value)
-        _notificationTestMessage.value = if (sent) {
-            "テスト通知を送信しました。通知欄を確認してください。"
-        } else {
-            "通知が許可されていないため送信できませんでした。端末の通知設定を確認してください。"
+        viewModelScope.launch {
+            val sent = NotificationHelper.sendTestNotification(getApplication(), kind, _settings.value)
+            _notificationTestMessage.value = if (sent) {
+                "テスト通知を送信しました。通知欄を確認してください。"
+            } else {
+                "通知が許可されていないため送信できませんでした。端末の通知設定を確認してください。"
+            }
         }
     }
 }

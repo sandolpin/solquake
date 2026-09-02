@@ -23,9 +23,19 @@ object WeatherRepository {
     private const val GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
     private const val AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 
-    /** 天気画面右上の検索アイコンから使う、地名→緯度経度の変換 */
+    /**
+     * 天気画面右上の検索アイコンから使う、地名→緯度経度の変換。
+     * 入力された文字列をそのままOpen-Meteoのジオコーディングに渡すだけのシンプルな構成。
+     */
     suspend fun searchLocations(query: String): List<WeatherLocation> = withContext(Dispatchers.IO) {
-        val url = "$GEOCODING_URL?name=${query}&count=8&language=ja&format=json"
+        if (query.isBlank()) return@withContext emptyList()
+
+        // 動作実績のある実装に合わせ、クエリは事前エンコードせずそのまま埋め込む。
+        // (OkHttpのRequest.Builder().url(String)は内部でURLを解析・正規化するため、
+        //  ここでURLEncoder.encode()を通した文字列を渡すと二重エンコードになり、
+        //  かえって日本語クエリが正しく届かなくなっていた)
+        val url = "$GEOCODING_URL?name=${query}&count=20&language=ja&format=json"
+
         val request = Request.Builder().url(url).build()
         client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) return@withContext emptyList()
@@ -38,7 +48,7 @@ object WeatherRepository {
         }
     }
 
-    /** 指定地点の天気予報を取得し、画面表示用に整形する(AQI・UV・気圧・湿度も合わせて取得する) */
+    /** 指定地点の天気予報を取得し、画面表示用に整形する(AQI・UV・気圧も合わせて取得する) */
     suspend fun fetchWeather(location: WeatherLocation, displayName: String): WeatherUiState =
         withContext(Dispatchers.IO) {
             val url = buildString {

@@ -15,19 +15,12 @@ import java.time.format.DateTimeFormatterBuilder
 
 /**
  * P2P地震情報API(地震情報/code=551)を定期取得し、UIに公開するRepository。
- * EewRepositoryと同じくobject(シングルトン)で実装し、Service/UIどちらからも参照できるようにする。
- *
- * このAPIは「地震が発生した後の観測情報」であり、緊急地震速報(EewRepository)ほど
- * 即時性がシビアではないため、専用のWebSocket接続は持たず、
- * EewServiceの常駐ループに相乗りしてポーリングする設計にしている
- * (常駐Foreground Serviceを2つ持つより省リソース)。
  */
 object QuakeRepository {
 
     private val client = OkHttpClient()
     private val gson = Gson()
 
-    // "2024/01/01 00:00:00.000" 形式(ミリ秒あり/なし両対応)
     private val inputTimeFormatter = DateTimeFormatterBuilder()
         .appendPattern("yyyy/MM/dd HH:mm:ss")
         .optionalStart()
@@ -46,7 +39,6 @@ object QuakeRepository {
     @Volatile
     private var hasPolledOnce = false
 
-    /** EewServiceのポーリングループから定期的に呼ばれる。新着があればtrueを返す(通知判定用)。 */
     suspend fun pollOnce(): List<QuakeCardState> = withContext(Dispatchers.IO) {
         try {
             val request = Request.Builder().url(HISTORY_URL).build()
@@ -60,9 +52,6 @@ object QuakeRepository {
                 _quakes.value = mapped.sortedByDescending { it.occurredAtLabel }
 
                 if (!hasPolledOnce) {
-                    // アプリ起動直後の初回取得は、既に発生済みの過去の地震情報(最大30件)を
-                    // 「新着」として扱わない。既知のIDとして記録するだけにして、
-                    // 起動のたびに古い地震の通知が大量発火するのを防ぐ。
                     mapped.forEach { seenIds.add(it.id) }
                     hasPolledOnce = true
                     return@withContext emptyList()
@@ -85,14 +74,22 @@ object QuakeRepository {
 
         return QuakeCardState(
             id = item.id,
+            code = item.code,
             hypocenterName = hypo?.name ?: "不明",
             depthKm = hypo?.depth?.takeIf { it >= 0 },
             magnitude = hypo?.magnitude?.takeIf { it >= 0 },
             occurredAtLabel = occurredAt,
+            rawOccurredAt = eq.time,
             latitude = hypo?.latitude ?: 0.0,
             longitude = hypo?.longitude ?: 0.0,
             maxScale = eq.maxScale,
-            points = item.points.orEmpty()
+            points = item.points.orEmpty(),
+            issueType = QuakeIssueType.fromApiValue(item.issue?.type),
+            issueSource = item.issue?.source,
+            issueTime = item.issue?.time,
+            issueCorrect = item.issue?.correct,
+            domesticTsunami = eq.domesticTsunami,
+            foreignTsunami = eq.foreignTsunami
         )
     }
 

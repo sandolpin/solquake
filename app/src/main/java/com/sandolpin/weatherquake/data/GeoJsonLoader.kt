@@ -5,42 +5,34 @@ import android.util.JsonReader
 import java.io.InputStreamReader
 
 /**
- * 座標抽出・バウンディングボックス計算まで済ませた状態のFeature。
+ * [MapLibre移行後の役割変更]
+ * 以前はここで全ポリゴン座標(FloatArray)を保持し、Compose/Canvasで自力描画していたが、
+ * 実際の地図描画(塗りつぶし・縁取り)はMapLibreのGeoJsonSourceがネイティブ側で
+ * 直接assets配下のgeojsonファイルを読み込んで行うようになったため不要になった。
  *
- * polygonsは [lon0, lat0, lon1, lat1, ...] のように経度緯度を交互に格納したFloatArrayのリスト。
- * List<Pair<Double,Double>>ではなくFloatArrayにしているのは、全国分(数十万点規模)を
- * 保持する際のメモリ・GC負荷を大幅に削減するため。
+ * このクラスは「カメラをどの範囲に合わせるか(バウンディングボックス)」を計算する目的にのみ
+ * 縮小した。ポリゴン座標そのものは保持しない(featureごとに一時的にリングを読み、
+ * bboxを計算したらすぐ捨てる)ため、以前よりメモリ使用量が大幅に少ない。
+ *
+ * 複数のgeojsonファイル(地方予報区用のjapan.geojson、市町村用のjapan_city.geojson)を
+ * 扱えるよう、assetファイル名ごとにキャッシュを持つ設計にしている。
  */
 data class PreparedFeature(
     val name: String,
-    val polygons: List<FloatArray>,
     val bbox: BoundingBox?
 )
 
-/**
- * assets/japan.geojson を読み込み、Chiiki名(気象庁の一次細分区域名/地方予報区名)に
- * 対応する座標データを提供するローダー。
- *
- * android.util.JsonReaderによるストリーミング解析で、必要な座標(外側リングのみ)を
- * 直接FloatArrayへ書き込むため、パース時間・メモリ使用量ともに軽量。
- * 解析結果は全国分をまとめて1回だけ計算し、以降はメモリキャッシュを再利用する。
- */
-object GeoJsonLoader {
-
-    private const val ASSET_FILE_NAME = "japan.geojson"
+class GeoJsonLoader private constructor(private val assetFileName: String) {
 
     @Volatile
-    private var cachedPreparedFeatures: List<PreparedFeature>? = null
+    private var cached: List<PreparedFeature>? = null
 
-    /**
-     * 全Featureの座標データを返す。初回のみassetsからストリーミング解析し、
-     * 以後はキャッシュを返す。呼び出し側はDispatchers.IO上から呼ぶこと。
-     */
+    /** 全Featureの名前+bboxを返す。初回のみassetsからストリーミング解析し、以後はキャッシュを返す。 */
     @Synchronized
     fun preparedFeatures(context: Context): List<PreparedFeature> {
-        cachedPreparedFeatures?.let { return it }
+        cached?.let { return it }
         val result = parseAsset(context)
-        cachedPreparedFeatures = result
+        cached = result
         return result
     }
 
@@ -49,16 +41,39 @@ object GeoJsonLoader {
         preparedFeatures(context)
     }
 
+    /** 指定した名前一覧に該当するFeatureのbboxをまとめて包含するBoundingBoxを返す */
+    fun boundingBoxFor(context: Context, names: Collection<String>): BoundingBox? {
+        if (names.isEmpty()) return null
+        val nameSet = names.toSet()
+        val boxes = preparedFeatures(context).filter { it.name in nameSet }.mapNotNull { it.bbox }
+        if (boxes.isEmpty()) return null
+        var minLon = Double.MAX_VALUE
+        var maxLon = -Double.MAX_VALUE
+        var minLat = Double.MAX_VALUE
+        var maxLat = -Double.MAX_VALUE
+        boxes.forEach { box ->
+            if (box.minLon < minLon) minLon = box.minLon
+            if (box.maxLon > maxLon) maxLon = box.maxLon
+            if (box.minLat < minLat) minLat = box.minLat
+            if (box.maxLat > maxLat) maxLat = box.maxLat
+        }
+        return BoundingBox(minLon, maxLon, minLat, maxLat)
+    }
+
     private fun parseAsset(context: Context): List<PreparedFeature> {
         val features = mutableListOf<PreparedFeature>()
-        context.assets.open(ASSET_FILE_NAME).use { input ->
+        context.assets.open(assetFileName).use { input ->
             JsonReader(InputStreamReader(input, "UTF-8")).use { reader ->
                 reader.beginObject()
                 while (reader.hasNext()) {
                     if (reader.nextName() == "features") {
                         reader.beginArray()
                         while (reader.hasNext()) {
-                            parseFeature(reader)?.let { features.add(it) }
+                            if (reader.peek() == android.util.JsonToken.NULL) {
+                                reader.nextNull()
+                            } else {
+                                parseFeature(reader)?.let { features.add(it) }
+                            }
                         }
                         reader.endArray()
                     } else {
@@ -73,104 +88,146 @@ object GeoJsonLoader {
 
     private fun parseFeature(reader: JsonReader): PreparedFeature? {
         var name = ""
-        var polygons: List<FloatArray> = emptyList()
+        var bbox: BoundingBox? = null
 
         reader.beginObject()
         while (reader.hasNext()) {
             when (reader.nextName()) {
                 "properties" -> {
-                    reader.beginObject()
-                    while (reader.hasNext()) {
-                        if (reader.nextName() == "name") {
-                            name = reader.nextString()
-                        } else {
-                            reader.skipValue()
+                    if (reader.peek() == android.util.JsonToken.NULL) {
+                        reader.nextNull()
+                    } else {
+                        reader.beginObject()
+                        while (reader.hasNext()) {
+                            if (reader.nextName() == "name") {
+                                name = if (reader.peek() == android.util.JsonToken.NULL) {
+                                    reader.nextNull()
+                                    ""
+                                } else {
+                                    reader.nextString()
+                                }
+                            } else {
+                                reader.skipValue()
+                            }
                         }
+                        reader.endObject()
                     }
-                    reader.endObject()
                 }
-                "geometry" -> polygons = parseGeometry(reader)
+                "geometry" -> bbox = parseGeometryBbox(reader)
                 else -> reader.skipValue()
             }
         }
         reader.endObject()
 
-        if (polygons.isEmpty()) return null
-        val bbox = GeoCoordinateUtil.boundingBox(polygons)
-        return PreparedFeature(name, polygons, bbox)
+        if (name.isBlank() || bbox == null) return null
+        return PreparedFeature(name, bbox)
     }
 
     /**
-     * Polygon/MultiPolygonのcoordinatesを読み、各ポリゴンの「外側リングのみ」をFloatArrayにする。
-     * 内側リング(穴)は描画対象外のため、skipValue()で読み飛ばす。
+     * Polygon/MultiPolygonのcoordinatesを読みながら、min/maxを都度更新するだけでbboxを求める。
+     * 座標配列そのものは保持しない(1点読んだら破棄する)ため、内側リング(穴)を含めて
+     * 全点を読んでも問題ない(描画に使わないので外側/内側を区別する必要も無い)。
+     *
+     * [null許容] GeoJSONは仕様上 "geometry": null や "coordinates": null を許容している
+     * (形状未確定のFeature等)。市町村レベルのデータはこのようなケースを含みやすいため、
+     * beginObject()/beginArray()を呼ぶ前に必ずJsonToken.NULLかどうかを確認している。
      */
-    private fun parseGeometry(reader: JsonReader): List<FloatArray> {
-        var geomType = ""
-        val polygons = mutableListOf<FloatArray>()
+    private fun parseGeometryBbox(reader: JsonReader): BoundingBox? {
+        if (reader.peek() == android.util.JsonToken.NULL) {
+            reader.nextNull()
+            return null
+        }
+
+        var minLon = Double.MAX_VALUE
+        var maxLon = -Double.MAX_VALUE
+        var minLat = Double.MAX_VALUE
+        var maxLat = -Double.MAX_VALUE
+        var found = false
+
+        fun visitPoint(lon: Double, lat: Double) {
+            if (lon < minLon) minLon = lon
+            if (lon > maxLon) maxLon = lon
+            if (lat < minLat) minLat = lat
+            if (lat > maxLat) maxLat = lat
+            found = true
+        }
+
+        fun readPositionArray() {
+            // [lon, lat] または [lon, lat, alt]
+            reader.beginArray()
+            val lon = if (reader.peek() == android.util.JsonToken.NULL) { reader.nextNull(); 0.0 } else reader.nextDouble()
+            val lat = if (reader.peek() == android.util.JsonToken.NULL) { reader.nextNull(); 0.0 } else reader.nextDouble()
+            while (reader.hasNext()) reader.skipValue()
+            reader.endArray()
+            visitPoint(lon, lat)
+        }
+
+        fun readRing() {
+            reader.beginArray()
+            while (reader.hasNext()) readPositionArray()
+            reader.endArray()
+        }
+
+        fun readPolygon() {
+            reader.beginArray()
+            while (reader.hasNext()) readRing()
+            reader.endArray()
+        }
 
         reader.beginObject()
+        var geomType = ""
         while (reader.hasNext()) {
             when (reader.nextName()) {
-                "type" -> geomType = reader.nextString()
+                "type" -> geomType = if (reader.peek() == android.util.JsonToken.NULL) {
+                    reader.nextNull()
+                    ""
+                } else {
+                    reader.nextString()
+                }
                 "coordinates" -> {
-                    when (geomType) {
-                        "Polygon" -> {
-                            reader.beginArray()
-                            var isOuter = true
-                            while (reader.hasNext()) {
-                                if (isOuter) {
-                                    polygons.add(parseRing(reader))
-                                    isOuter = false
-                                } else {
-                                    reader.skipValue()
-                                }
-                            }
-                            reader.endArray()
-                        }
-                        "MultiPolygon" -> {
-                            reader.beginArray()
-                            while (reader.hasNext()) {
+                    if (reader.peek() == android.util.JsonToken.NULL) {
+                        reader.nextNull()
+                    } else {
+                        when (geomType) {
+                            "Polygon" -> readPolygon()
+                            "MultiPolygon" -> {
                                 reader.beginArray()
-                                var isOuter = true
-                                while (reader.hasNext()) {
-                                    if (isOuter) {
-                                        polygons.add(parseRing(reader))
-                                        isOuter = false
-                                    } else {
-                                        reader.skipValue()
-                                    }
-                                }
+                                while (reader.hasNext()) readPolygon()
                                 reader.endArray()
                             }
-                            reader.endArray()
+                            else -> reader.skipValue()
                         }
-                        else -> reader.skipValue()
                     }
                 }
                 else -> reader.skipValue()
             }
         }
         reader.endObject()
-        return polygons
+
+        return if (found) BoundingBox(minLon, maxLon, minLat, maxLat) else null
     }
 
-    /** 1つのリング([[lon,lat], [lon,lat], ...])を読み、[lon0,lat0,lon1,lat1,...]のFloatArrayにする */
-    private fun parseRing(reader: JsonReader): FloatArray {
-        val buffer = ArrayList<Float>()
-        reader.beginArray()
-        while (reader.hasNext()) {
-            reader.beginArray()
-            val lon = reader.nextDouble()
-            val lat = reader.nextDouble()
-            while (reader.hasNext()) reader.skipValue()
-            reader.endArray()
-            buffer.add(lon.toFloat())
-            buffer.add(lat.toFloat())
-        }
-        reader.endArray()
+    companion object {
+        private const val REGION_ASSET = "japan.geojson"
+        private const val CITY_ASSET = "japan_city.geojson"
 
-        val array = FloatArray(buffer.size)
-        for (i in buffer.indices) array[i] = buffer[i]
-        return array
+        private val instances = java.util.concurrent.ConcurrentHashMap<String, GeoJsonLoader>()
+
+        private fun instanceFor(assetFileName: String): GeoJsonLoader =
+            instances.getOrPut(assetFileName) { GeoJsonLoader(assetFileName) }
+
+        /** 地方予報区・都道府県レベル(緊急地震速報のWarnAreaで使用) */
+        val region: GeoJsonLoader get() = instanceFor(REGION_ASSET)
+
+        /** 市町村レベル(地震情報の観測点を市町村単位で塗りたい場合に使用) */
+        val city: GeoJsonLoader get() = instanceFor(CITY_ASSET)
+
+        /** アプリ起動時に両方のgeojsonを事前解析しておく */
+        fun preloadAll(context: Context) {
+            region.preload(context)
+            // japan_city.geojsonが未配置の場合はここで例外が出るが、
+            // 呼び出し側(WeatherQuakeApp)でtry-catchしているため致命的にはならない。
+            city.preload(context)
+        }
     }
 }
